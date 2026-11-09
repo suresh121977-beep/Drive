@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Drive Toolkit</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--card:#f1f3f4;--ac:#1a73e8}
+@media (prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--card:#262626;--ac:#8ab4f8}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif;max-width:760px;margin-inline:auto}
+h1{font-size:19px;margin:0 0 8px}
+input,button,select{font:inherit;padding:9px 12px;border-radius:8px;border:1px solid #8884;background:var(--card);color:var(--fg);margin:3px 3px 3px 0;max-width:100%}
+input[type=checkbox]{padding:0;margin:0 8px 0 0}
+button{background:var(--ac);color:#fff;border:0;cursor:pointer}
+button.t{background:var(--card);color:var(--fg)}button.t.on{background:var(--ac);color:#fff}
+button.d{background:#d93025}
+section{display:none;background:var(--card);border-radius:12px;padding:12px;margin-top:8px}
+section.on{display:block}
+.r{display:flex;align-items:center;padding:5px 0;word-break:break-all;font-size:14px}
+.g{border-top:1px solid #8884;margin-top:8px;padding-top:6px}
+small{opacity:.7;margin-left:6px}
+progress{width:100%}
+#log{white-space:pre-wrap;font:12px monospace;max-height:180px;overflow:auto;background:var(--card);border-radius:8px;padding:8px;margin-top:8px}
+a{color:var(--ac)}
+</style></head><body>
+<h1>Drive Toolkit</h1>
+<div>
+<input id="cid" placeholder="Google OAuth Client ID" style="width:100%">
+<button id="si">Sign in to Google</button> <span id="st">Not signed in</span>
+<details><summary>Setup help</summary><p style="font-size:13px">Google Cloud Console: new project, enable <b>Google Drive API</b>, OAuth consent screen (add yourself as test user), Credentials, OAuth client ID (Web). Add this page's origin (e.g. https://name.github.io) under <b>Authorized JavaScript origins</b>. Paste the Client ID above.</p></details>
+</div>
+<div style="margin-top:8px"><button class="t on" data-t="a">Duplicates</button><button class="t" data-t="b">Upload</button><button class="t" data-t="c">Merge / Download</button></div>
+
+<section id="a" class="on">
+<button id="scan">Scan my Drive</button><button id="trash" class="d">Move selected to Trash</button>
+<p style="font-size:13px">Matches files by content hash (MD5). The oldest copy in each group is kept; others are pre-selected. Trash is recoverable for 30 days.</p>
+<div id="dups"></div>
+</section>
+
+<section id="b">
+<label>Files <input id="fi" type="file" multiple></label><br>
+<label>Folder <input id="fo" type="file" webkitdirectory multiple></label><br>
+<input id="dn" placeholder="New Drive folder name (optional)"><br>
+<input id="pw" type="password" placeholder="Password (empty = no encryption)"><br>
+<input id="sp" type="number" min="0" placeholder="Split size in MB (0 = no split)"><br>
+<button id="up">Upload</button><button id="dl" class="t" hidden>Download JSON</button>
+<progress id="pg" value="0" max="1"></progress>
+<p style="font-size:13px">Encrypted or split files are uploaded as numbered parts plus a <code>.manifest.json</code> that lists every part name, used later to merge. Encryption is AES-256-GCM in your browser; the password is never stored or sent.</p>
+</section>
+
+<section id="c">
+<button id="fm">Find manifests in Drive</button> <select id="ms"></select><br>
+<label>or local manifest <input id="mf" type="file" accept=".json"></label><br>
+<input id="pw2" type="password" placeholder="Password (if encrypted)"><br>
+<button id="mg">Merge and download</button>
+<progress id="pg2" value="0" max="1"></progress>
+</section>
+<div id="log"></div>
+
+<script>
+var $=function(i){return document.getElementById(i)},tok=null,groups=[],mans=[],manifests=[];
+var enc=new TextEncoder(),JH={'Content-Type':'application/json'};
+function L(m){var d=$('log');d.textContent+=m+'\n';d.scrollTop=d.scrollHeight}
+function esc(t){return String(t).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function mb(n){return(n/1048576).toFixed(1)+' MB'}
+try{$('cid').value=localStorage.getItem('cid')||''}catch(e){}
+document.querySelectorAll('[data-t]').forEach(function(b){b.onclick=function(){
+ document.querySelectorAll('section').forEach(function(s){s.classList.toggle('on',s.id==b.dataset.t)});
+ document.querySelectorAll('[data-t]').forEach(function(x){x.classList.toggle('on',x==b)})}});
+$('si').onclick=function(){
+ var c=$('cid').value.trim();if(!c)return L('Enter your Client ID first');
+ try{localStorage.setItem('cid',c)}catch(e){}
+ if(!window.google)return L('Google script not loaded yet (check internet)');
+ google.accounts.oauth2.initTokenClient({client_id:c,scope:'https://www.googleapis.com/auth/drive',
+  callback:function(r){if(r.access_token){tok=r.access_token;$('st').textContent='Signed in'}else L('Sign-in failed')}}).requestAccessToken()};
+function need(){if(!tok){L('Sign in first');return false}return true}
+async function api(p,o){o=o||{};o.headers=Object.assign({Authorization:'Bearer '+tok},o.headers||{});
+ var r=await fetch('https://www.googleapis.com/drive/v3/'+p,o);if(!r.ok)throw new Error(await r.text());return r}
+
+/* ---------- duplicates ---------- */
+$('scan').onclick=async function(){
+ if(!need())return;L('Scanning...');var f=[],pt='';
+ try{do{var r=await(await api('files?pageSize=1000&fields=nextPageToken,files(id,name,size,md5Checksum,createdTime)&q='+
+  encodeURIComponent("trashed=false and mimeType!='application/vnd.google-apps.folder'")+(pt?'&pageToken='+pt:''))).json();
+  f=f.concat(r.files);pt=r.nextPageToken;L('Read '+f.length+' files')}while(pt)}catch(e){return L('Error: '+e.message)}
+ var m={};f.forEach(function(x){if(x.md5Checksum&&+x.size>0)(m[x.md5Checksum]=m[x.md5Checksum]||[]).push(x)});
+ groups=Object.values(m).filter(function(g){return g.length>1});
+ var h='',waste=0;
+ groups.forEach(function(g){g.sort(function(a,b){return a.createdTime<b.createdTime?-1:1});
+  waste+=(g.length-1)*+g[0].size;
+  h+='<div class="g"><b>'+g.length+' copies</b><small>'+mb(+g[0].size)+' each</small>'+g.map(function(x,i){
+   return '<label class="r"><input type="checkbox" data-id="'+x.id+'"'+(i?' checked':'')+'><a target="_blank" href="https://drive.google.com/file/d/'+x.id+'/view">'+esc(x.name)+'</a><small>'+x.createdTime.slice(0,10)+(i?'':' (keep)')+'</small></label>'}).join('')+'</div>'});
+ $('dups').innerHTML=groups.length?'<p>'+groups.length+' duplicate groups, about '+mb(waste)+' reclaimable.</p>'+h:'<p>No duplicates found.</p>';
+ L('Scan done')};
+$('trash').onclick=async function(){
+ if(!need())return;var ids=[].map.call(document.querySelectorAll('#dups input:checked'),function(i){return i.dataset.id});
+ if(!ids.length||!confirm('Move '+ids.length+' files to Trash?'))return;
+ for(var i=0;i<ids.length;i++){try{await api('files/'+ids[i],{method:'PATCH',headers:JH,body:JSON.stringify({trashed:true})});
+  var cb=document.querySelector('[data-id="'+ids[i]+'"]');if(cb)cb.closest('label').style.opacity=.3}catch(e){L('Failed: '+e.message)}}
+ L('Moved '+ids.length+' files to Trash')};
+
+/* ---------- crypto ---------- */
+async function mkKey(pw,salt,it){var k=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveKey']);
+ return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:it,hash:'SHA-256'},k,{name:'AES-GCM',length:256},false,['encrypt','decrypt'])}
+async function encB(key,blob){var iv=crypto.getRandomValues(new Uint8Array(12));
+ var ct=await crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,await blob.arrayBuffer());return new Blob([iv,ct])}
+async function decB(key,blob){var b=await blob.arrayBuffer();
+ return new Blob([await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(b.slice(0,12))},key,b.slice(12))])}
+function b64(u){return btoa(String.fromCharCode.apply(null,u))}
+function unb64(s){return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)})}
+
+/* ---------- upload ---------- */
+async function mkFolder(name,parent){var r=await api('files?fields=id',{method:'POST',headers:JH,
+ body:JSON.stringify({name:name,mimeType:'application/vnd.google-apps.folder',parents:parent?[parent]:undefined})});return(await r.json()).id}
+async function put(name,blob,parent,mime){
+ var i=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id',{method:'POST',
+  headers:{Authorization:'Bearer '+tok,'Content-Type':'application/json; charset=UTF-8','X-Upload-Content-Type':mime||'application/octet-stream'},
+  body:JSON.stringify({name:name,parents:parent?[parent]:undefined})});
+ if(!i.ok)throw new Error(await i.text());
+ var r=await fetch(i.headers.get('Location'),{method:'PUT',body:blob});
+ if(!r.ok)throw new Error(await r.text());return(await r.json()).id}
+$('up').onclick=async function(){
+ if(!need())return;var fl=[].concat([].slice.call($('fi').files),[].slice.call($('fo').files));
+ if(!fl.length)return L('Pick files or a folder first');
+ var pw=$('pw').value,sp=parseFloat($('sp').value)||0,dn=$('dn').value.trim(),cache={},done=[],total=fl.reduce(function(a,f){return a+f.size},0)||1,sent=0;
+ manifests=[];$('dl').hidden=true;
+ try{var root=dn?await mkFolder(dn,null):null;if(dn)L('Created folder '+dn)}catch(e){return L('Error: '+e.message)}
+ for(var q=0;q<fl.length;q++){var f=fl[q],rel=f.webkitRelativePath||f.name;
+  try{
+   var p=root,k='',dirs=rel.split('/').slice(0,-1);
+   for(var d=0;d<dirs.length;d++){k+='/'+dirs[d];if(!cache[k])cache[k]=await mkFolder(dirs[d],p);p=cache[k]}
+   var cs=sp?sp*1048576:(pw?64*1048576:Math.max(f.size,1)),n=Math.max(1,Math.ceil(f.size/cs));
+   if(!pw&&n==1){await put(f.name,f,p,f.type);L('Uploaded '+rel)}
+   else{
+    var salt=crypto.getRandomValues(new Uint8Array(16)),it=200000,key=pw?await mkKey(pw,salt,it):null,parts=[];
+    for(var i=0;i<n;i++){var part=f.slice(i*cs,(i+1)*cs);if(key)part=await encB(key,part);
+     var pn=f.name+'.part'+String(i+1).padStart(3,'0')+(key?'.enc':'');
+     var id=await put(pn,part,p,'application/octet-stream');parts.push({n:i+1,name:pn,id:id,size:part.size});
+     sent+=Math.min(cs,f.size-i*cs);$('pg').value=sent/total;L('Uploaded '+pn)}
+    var man={v:1,name:f.name,path:rel,size:f.size,type:f.type,encrypted:!!key,salt:key?b64(salt):null,iterations:it,parts:parts};
+    await put(f.name+'.manifest.json',new Blob([JSON.stringify(man,null,2)],{type:'application/json'}),p,'application/json');
+    manifests.push(man);L('Saved manifest for '+f.name)}
+   done.push(rel)
+  }catch(e){L('Failed '+rel+': '+e.message)}
+  sent=Math.max(sent,0);$('pg').value=Math.min(1,(q+1)/fl.length)}
+ var fj={name:dn||'(root)',created:new Date().toISOString(),encrypted:!!pw,split_mb:sp,files:done,manifests:manifests};
+ try{if(root)await put('_folder.json',new Blob([JSON.stringify(fj,null,2)],{type:'application/json'}),root,'application/json')}catch(e){}
+ $('dl').hidden=false;$('dl').onclick=function(){var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(fj,null,2)],{type:'application/json'}));a.download=(dn||'upload')+'.json';a.click()};
+ L('Done: '+done.length+'/'+fl.length+' files')};
+
+/* ---------- merge / download ---------- */
+$('fm').onclick=async function(){
+ if(!need())return;try{var r=await(await api('files?pageSize=200&fields=files(id,name)&q='+encodeURIComponent("name contains '.manifest.json' and trashed=false"))).json();
+  mans=r.files;$('ms').innerHTML=mans.map(function(m,i){return '<option value="'+i+'">'+esc(m.name)+'</option>'}).join('');L('Found '+mans.length+' manifests')}catch(e){L('Error: '+e.message)}};
+async function dlBlob(id){return(await api('files/'+id+'?alt=media')).blob()}
+$('mg').onclick=async function(){
+ if(!need())return;var man;
+ try{if($('mf').files[0])man=JSON.parse(await $('mf').files[0].text());
+  else if(mans.length)man=JSON.parse(await(await dlBlob(mans[$('ms').value].id)).text());
+  else return L('Find or choose a manifest first')}catch(e){return L('Bad manifest: '+e.message)}
+ var key=null;
+ try{if(man.encrypted){var pw=$('pw2').value;if(!pw)return L('Enter the password');key=await mkKey(pw,unb64(man.salt),man.iterations)}
+  var out=[];
+  for(var i=0;i<man.parts.length;i++){var p=man.parts[i];L('Downloading '+p.name);var b=await dlBlob(p.id);
+   if(key){try{b=await decB(key,b)}catch(e){return L('Wrong password or corrupted part: '+p.name)}}
+   out.push(b);$('pg2').value=(i+1)/man.parts.length}
+  var a=document.createElement('a');a.href=URL.createObjectURL(new Blob(out,{type:man.type||'application/octet-stream'}));a.download=man.name;a.click();L('Merged: '+man.name)
+ }catch(e){L('Error: '+e.message)}};
+</script></body></html>
